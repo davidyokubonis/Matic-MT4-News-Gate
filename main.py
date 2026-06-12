@@ -100,7 +100,7 @@ def calculate_window(events: list[datetime]) -> tuple[datetime, datetime] | None
     earliest = min(events)
     latest = max(events)
     window_start = earliest + timedelta(minutes=5)
-    window_end = latest + timedelta(hours=5)
+    window_end = latest + timedelta(hours=6)
     return window_start, window_end
 
 
