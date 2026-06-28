@@ -22,6 +22,47 @@ UTC_TZ = pytz.utc
 FF_FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 CACHE_TTL_SECONDS = 15 * 60
 
+ENABLE_CORRELATED_NEWS = True
+
+CORRELATED_NEWS_UNLOCKS = {
+    "USD": [
+        "EURJPY",
+        "GBPJPY",
+        "AUDJPY",
+        "NZDJPY",
+        "CADJPY",
+        "CHFJPY",
+        "AUDCAD",
+        "NZDCAD",
+    ],
+    "EUR": [
+        "GBPUSD",
+    ],
+    "GBP": [
+        "EURUSD",
+    ],
+    "JPY": [
+    ],
+    "AUD": [
+        "NZDUSD",
+        "NZDJPY",
+        "NZDCAD",
+    ],
+    "NZD": [
+        "AUDUSD",
+        "AUDJPY",
+        "AUDCAD",
+    ],
+    "CAD": [
+        "AUDUSD",
+        "NZDUSD",
+        "AUDJPY",
+        "NZDJPY",
+    ],
+    "CHF": [
+    ],
+}
+
 _cache_events: list[tuple[str, datetime]] = []
 _cache_fetched_at: datetime | None = None
 _cache_status: str = "empty"
@@ -77,18 +118,23 @@ def get_news_events() -> list[tuple[str, datetime]]:
                 _cache_status = f"stale_cache ({age_min}m old)"
                 log.warning("Using stale FF cache (%dm old) — feed unreachable", age_min)
             else:
-                _cache_status = "feed_unreachable"
+                _cache_status = f"feed_unreachable"
                 log.error("FF feed unreachable and no cache available — blocking all alerts")
                 return []
 
     return _cache_events
 
 
-def parse_symbol(symbol: str) -> tuple[str, str] | None:
+def normalize_symbol(symbol: str) -> str:
     symbol = symbol.strip().upper()
     for suffix in (".PRO", ".FX", "=X", "_SB", "_OTC"):
         if symbol.endswith(suffix):
             symbol = symbol[: -len(suffix)]
+    return symbol
+
+
+def parse_symbol(symbol: str) -> tuple[str, str] | None:
+    symbol = normalize_symbol(symbol)
     if len(symbol) == 6 and symbol.isalpha():
         return symbol[:3], symbol[3:]
     return None
@@ -111,13 +157,26 @@ def is_alert_allowed(symbol: str, now_ny: datetime) -> tuple[bool, str]:
 
     base, quote = currencies
     today_str = now_ny.strftime("%Y-%m-%d")
+
     all_events = get_news_events()
+
+    symbol_clean = normalize_symbol(symbol)
+    direct_currencies = {base, quote}
 
     relevant: list[datetime] = []
     for currency, event_dt in all_events:
-        if currency in (base, quote):
-            if event_dt.strftime("%Y-%m-%d") == today_str:
-                relevant.append(event_dt)
+        if event_dt.strftime("%Y-%m-%d") != today_str:
+            continue
+
+        direct_match = currency in direct_currencies
+
+        correlated_match = (
+            ENABLE_CORRELATED_NEWS
+            and symbol_clean in CORRELATED_NEWS_UNLOCKS.get(currency, [])
+        )
+
+        if direct_match or correlated_match:
+            relevant.append(event_dt)
 
     if not relevant:
         return False, (
@@ -180,6 +239,7 @@ def webhook():
             return jsonify({"status": "unauthorized"}), 401
 
     raw_body = request.data.decode("utf-8").strip()
+
     content_type = request.content_type or ""
     is_text = not raw_body.startswith("{") and "json" not in content_type.lower()
 
@@ -204,8 +264,11 @@ def webhook():
 
     log.info(
         "Alert | symbol=%s | format=%s | time_ny=%s | allowed=%s | %s",
-        symbol, "text" if is_text else "json",
-        now_ny.strftime("%Y-%m-%d %H:%M:%S"), allowed, reason,
+        symbol,
+        "text" if is_text else "json",
+        now_ny.strftime("%Y-%m-%d %H:%M:%S"),
+        allowed,
+        reason,
     )
 
     if not allowed:
@@ -219,7 +282,11 @@ def webhook():
         forward_body = raw_body if is_text else payload
         resp = forward_alert(forward_body, is_text=is_text)
         log.info("Forwarded alert for %s — upstream status %s", symbol, resp.status_code)
-        return jsonify({"status": "forwarded", "reason": reason, "upstream_status": resp.status_code}), 200
+        return jsonify({
+            "status": "forwarded",
+            "reason": reason,
+            "upstream_status": resp.status_code,
+        }), 200
     except requests.RequestException as exc:
         log.error("Failed to forward alert: %s", exc)
         return jsonify({"status": "error", "message": str(exc)}), 502
@@ -236,7 +303,8 @@ def status():
         if event_dt.strftime("%Y-%m-%d") == today_str:
             by_currency.setdefault(currency, []).append(event_dt.strftime("%H:%M"))
 
-    test_pairs = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "NZDUSD", "USDCAD", "USDCHF", "GBPJPY", "EURJPY", "AUDNZD"]
+    test_pairs = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "NZDUSD", "USDCAD", "USDCHF",
+                  "GBPJPY", "EURJPY", "AUDNZD"]
     windows = {}
     for sym in test_pairs:
         allowed, reason = is_alert_allowed(sym, now_ny)
@@ -249,7 +317,12 @@ def status():
 
     return jsonify({
         "now_ny": now_ny.strftime("%Y-%m-%d %H:%M:%S %Z"),
-        "data_source": {"feed": FF_FEED_URL, "status": _cache_status, "last_fetched": cache_age_str, "cache_ttl_seconds": CACHE_TTL_SECONDS},
+        "data_source": {
+            "feed": FF_FEED_URL,
+            "status": _cache_status,
+            "last_fetched": cache_age_str,
+            "cache_ttl_seconds": CACHE_TTL_SECONDS,
+        },
         "news_today": by_currency,
         "windows": windows,
     })
