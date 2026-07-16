@@ -80,7 +80,7 @@ def _fetch_ff_calendar() -> tuple[list[tuple[str, datetime]], str]:
 
     events: list[tuple[str, datetime]] = []
     for item in data:
-        if str(item.get("impact", "")).strip().lower() != "high":
+        if str(item.get("impact", "")).strip().lower() not in ("high", "medium"):
             continue
         currency = str(item.get("country", "")).strip().upper()
         if not currency:
@@ -96,7 +96,7 @@ def _fetch_ff_calendar() -> tuple[list[tuple[str, datetime]], str]:
             continue
         events.append((currency, dt_ny))
 
-    log.info("Forex Factory feed loaded: %d high-impact events this week", len(events))
+    log.info("Forex Factory feed loaded: %d high/medium-impact events this week", len(events))
     return events, "ok"
 
 
@@ -180,7 +180,7 @@ def is_alert_allowed(symbol: str, now_ny: datetime) -> tuple[bool, str]:
 
     if not relevant:
         return False, (
-            f"No high-impact news today ({today_str} NY) for {base} or {quote}. "
+            f"No high/medium-impact news today ({today_str} NY) for {base} or {quote}. "
             "Alerts blocked — window has not opened."
         )
 
