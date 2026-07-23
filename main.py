@@ -22,6 +22,9 @@ UTC_TZ = pytz.utc
 FF_FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 CACHE_TTL_SECONDS = 15 * 60
 
+WINDOW_LEAD_MINUTES = 5
+WINDOW_TRAIL_HOURS = 5
+
 ENABLE_CORRELATED_NEWS = True
 
 CORRELATED_NEWS_UNLOCKS = {
@@ -118,7 +121,7 @@ def get_news_events() -> list[tuple[str, datetime]]:
                 _cache_status = f"stale_cache ({age_min}m old)"
                 log.warning("Using stale FF cache (%dm old) — feed unreachable", age_min)
             else:
-                _cache_status = f"feed_unreachable"
+                _cache_status = "feed_unreachable"
                 log.error("FF feed unreachable and no cache available — blocking all alerts")
                 return []
 
@@ -140,14 +143,17 @@ def parse_symbol(symbol: str) -> tuple[str, str] | None:
     return None
 
 
-def calculate_window(events: list[datetime]) -> tuple[datetime, datetime] | None:
-    if not events:
-        return None
-    earliest = min(events)
-    latest = max(events)
-    window_start = earliest + timedelta(minutes=5)
-    window_end = latest + timedelta(hours=6)
-    return window_start, window_end
+def build_event_windows(events: list[datetime]) -> list[tuple[datetime, datetime]]:
+    """Each news event gets its own window; overlapping windows are handled
+    by checking membership individually rather than merging into one span."""
+    windows = [
+        (
+            event_dt + timedelta(minutes=WINDOW_LEAD_MINUTES),
+            event_dt + timedelta(hours=WINDOW_TRAIL_HOURS),
+        )
+        for event_dt in events
+    ]
+    return sorted(windows)
 
 
 def is_alert_allowed(symbol: str, now_ny: datetime) -> tuple[bool, str]:
@@ -156,8 +162,6 @@ def is_alert_allowed(symbol: str, now_ny: datetime) -> tuple[bool, str]:
         return False, f"Cannot parse symbol '{symbol}'"
 
     base, quote = currencies
-    today_str = now_ny.strftime("%Y-%m-%d")
-
     all_events = get_news_events()
 
     symbol_clean = normalize_symbol(symbol)
@@ -165,47 +169,42 @@ def is_alert_allowed(symbol: str, now_ny: datetime) -> tuple[bool, str]:
 
     relevant: list[datetime] = []
     for currency, event_dt in all_events:
-        if event_dt.strftime("%Y-%m-%d") != today_str:
-            continue
-
         direct_match = currency in direct_currencies
-
         correlated_match = (
             ENABLE_CORRELATED_NEWS
             and symbol_clean in CORRELATED_NEWS_UNLOCKS.get(currency, [])
         )
-
         if direct_match or correlated_match:
             relevant.append(event_dt)
 
     if not relevant:
         return False, (
-            f"No high/medium-impact news today ({today_str} NY) for {base} or {quote}. "
-            "Alerts blocked — window has not opened."
+            f"No high/medium-impact news this week for {base} or {quote} "
+            "(direct or correlated). Alerts blocked — window has not opened."
         )
 
-    window = calculate_window(relevant)
-    if window is None:
-        return False, "Could not compute trading window."
+    windows = build_event_windows(relevant)
 
-    window_start, window_end = window
+    for start, end in windows:
+        if start <= now_ny <= end:
+            return True, (
+                f"Inside window [{start.strftime('%Y-%m-%d %H:%M')} - "
+                f"{end.strftime('%Y-%m-%d %H:%M')} NY]."
+            )
 
-    if now_ny < window_start:
-        wait_secs = int((window_start - now_ny).total_seconds())
+    upcoming = [w for w in windows if now_ny < w[0]]
+    if upcoming:
+        start, _ = min(upcoming)
+        wait_secs = int((start - now_ny).total_seconds())
         return False, (
-            f"Too early — window opens at {window_start.strftime('%H:%M')} NY "
+            f"Too early — next window opens at {start.strftime('%Y-%m-%d %H:%M')} NY "
             f"({wait_secs}s from now)."
         )
 
-    if now_ny > window_end:
-        return False, (
-            f"Window closed at {window_end.strftime('%H:%M')} NY. "
-            "Next window opens with tomorrow's news."
-        )
-
-    return True, (
-        f"Inside window [{window_start.strftime('%H:%M')} – "
-        f"{window_end.strftime('%H:%M')} NY]."
+    last_end = max(end for _, end in windows)
+    return False, (
+        f"All news windows for {base}/{quote} have closed (last one ended "
+        f"{last_end.strftime('%Y-%m-%d %H:%M')} NY). Next window opens with new news."
     )
 
 
